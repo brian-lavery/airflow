@@ -18,14 +18,23 @@
 #
 
 import datetime
+import logging
+import uuid
+import enum
 
 from airflow.exceptions import AirflowException
 from airflow.hooks.base_hook import BaseHook
 from airflow.utils.decorators import apply_defaults
 
 from airflow.providers.greatexpectations.operators.greatexpectations_base import GreatExpectationsBaseOperator
-from airflow.providers.greatexpectations.hooks.bigquery_gcs import GreatExpectationsBigQueryGCSHook
-from airflow.providers.greatexpectations.hooks.great_expectations import GreatExpectationsValidations
+from great_expectations.data_context.types.base import DataContextConfig
+
+log = logging.getLogger(__name__)
+
+
+class GreatExpectationsValidations(enum.Enum):
+    SQL = "SQL"
+    TABLE = "TABLE"
 
 
 class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
@@ -114,22 +123,127 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
         self.gcs_datadocs_prefix = gcs_datadocs_prefix
         self.datadocs_domain = datadocs_domain
 
-    def execute(self, context):
+    def create_data_context_config(self):
 
-        # Get the credentials information for the BigQuery data source from the BigQuery Airflow connection
         conn = BaseHook.get_connection(self.bigquery_conn_id)
         connection_json = conn.extra_dejson
         credentials_path = connection_json['extra__google_cloud_platform__key_path']
-        hook = GreatExpectationsBigQueryGCSHook(self.gcp_project, self.bq_dataset_name, credentials_path,
-                                                self.validation_type, self.validation_type_input, self.gcs_bucket,
-                                                self.gcs_expectations_prefix, self.gcs_validations_prefix,
-                                                self.gcs_datadocs_prefix)
-        ge_connection = hook.get_conn()
-        data_context = ge_connection.create_data_context()
+        data_context_config = DataContextConfig(
+            config_version=2,
+            datasources={
+                "bq_datasource": {
+                    "credentials": {
+                        "url": "bigquery://" + self.gcp_project + "/" + self.bq_dataset_name + "?credentials_path=" +
+                               credentials_path
+                    },
+                    "class_name": "SqlAlchemyDatasource",
+                    "module_name": "great_expectations.datasource",
+                    "data_asset_type": {
+                        "module_name": "great_expectations.dataset",
+                        "class_name": "SqlAlchemyDataset"
+                    }
+                }
+            },
+            expectations_store_name="expectations_GCS_store",
+            validations_store_name="validations_GCS_store",
+            evaluation_parameter_store_name="evaluation_parameter_store",
+            plugins_directory=None,
+            validation_operators={
+                "action_list_operator": {
+                    "class_name": "ActionListValidationOperator",
+                    "action_list": [
+                        {
+                            "name": "store_validation_result",
+                            "action": {"class_name": "StoreValidationResultAction"},
+                        },
+                        {
+                            "name": "store_evaluation_params",
+                            "action": {"class_name": "StoreEvaluationParametersAction"},
+                        },
+                        {
+                            "name": "update_data_docs",
+                            "action": {"class_name": "UpdateDataDocsAction"},
+                        },
+                    ],
+                }
+            },
+            stores={
+                'expectations_GCS_store': {
+                    'class_name': 'ExpectationsStore',
+                    'store_backend': {
+                        'class_name': 'TupleGCSStoreBackend',
+                        'project': self.gcp_project,
+                        'bucket': self.gcs_bucket,
+                        'prefix': self.gcs_expectations_prefix
+                    }
+                },
+                'validations_GCS_store': {
+                    'class_name': 'ValidationsStore',
+                    'store_backend': {
+                        'class_name': 'TupleGCSStoreBackend',
+                        'project': self.gcp_project,
+                        'bucket': self.gcs_bucket,
+                        'prefix': self.gcs_validations_prefix
+                    }
+                },
+                "evaluation_parameter_store": {"class_name": "EvaluationParameterStore"},
+            },
+            data_docs_sites={
+                "GCS_site": {
+                    "class_name": "SiteBuilder",
+                    "store_backend": {
+                        "class_name": "TupleGCSStoreBackend",
+                        "project": self.gcp_project,
+                        "bucket": self.gcs_bucket,
+                        'prefix': self.gcs_datadocs_prefix
+                    },
+                    "site_index_builder": {
+                        "class_name": "DefaultSiteIndexBuilder",
+                    },
+                }
+            },
+            config_variables_file_path=None,
+            commented_map=None,
+        )
+        return data_context_config
+
+
+    def get_batch_kwargs(self):
+        # Tell GE where to fetch the batch of data to be validated.
+        batch_kwargs = {
+            "datasource": "bq_datasource",
+        }
+
+        if self.validation_type == GreatExpectationsValidations.SQL.value:
+            batch_kwargs["query"] = self.validation_type_input
+            batch_kwargs["data_asset_name"] = self.bq_dataset_name
+            batch_kwargs["bigquery_temp_table"] = self.get_temp_table_name(
+                'temp_ge_' + datetime.datetime.now().strftime('%Y%m%d') + '_', 10)
+        elif self.validation_type == GreatExpectationsValidations.TABLE.value:
+            batch_kwargs["table"] = self.validation_type_input
+            batch_kwargs["data_asset_name"] = self.bq_dataset_name
+
+        self.log.info("batch_kwargs: " + str(batch_kwargs))
+
+        return batch_kwargs
+
+    # Generate a unique name for a temporary table.  For example, if desired_prefix= 'temp_ge_' and
+    # desired_length_of_random_portion = 10 then the following table name might be generated: 'temp_ge_304kcj39rM'.
+    def get_temp_table_name(self, desired_prefix, desired_length_of_random_portion):
+        random_string = str(uuid.uuid4().hex)
+        random_portion_of_name = random_string[:desired_length_of_random_portion]
+        full_name = desired_prefix + random_portion_of_name
+        log.info("Generated name for temporary table: %s", full_name)
+        return full_name
+
+    def execute(self, context):
+
+        # Get the credentials information for the BigQuery data source from the BigQuery Airflow connection
+        data_context = self.create_data_context_config()
         self.log.info("Loading expectations...")
         suite = data_context.get_expectation_suite((self.expectations_file_name.rsplit(".", 1)[0]))
 
-        batch_kwargs = hook.get_batch_kwargs()
+        batch_kwargs = self.get_batch_kwargs()
 
         self.log.info("Getting the batch of data to be validated...")
         batch = data_context.get_batch(batch_kwargs, suite)
