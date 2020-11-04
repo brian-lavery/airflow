@@ -28,6 +28,7 @@ from airflow.utils.decorators import apply_defaults
 
 from airflow.providers.greatexpectations.operators.greatexpectations_base import GreatExpectationsBaseOperator
 from great_expectations.data_context.types.base import DataContextConfig
+from great_expectations.data_context import BaseDataContext
 
 log = logging.getLogger(__name__)
 
@@ -98,19 +99,21 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
     """
 
     @apply_defaults
-    def __init__(self, *, gcp_project, expectations_file_name, gcs_bucket, gcs_expectations_prefix,
+    def __init__(self, *, task_id, gcp_project, expectations_file_name, gcs_bucket, gcs_expectations_prefix,
                  gcs_validations_prefix, gcs_datadocs_prefix, validation_type, validation_type_input,
                  bq_dataset_name, email_to, datadocs_domain='none', send_alert_email=True,
                  datadocs_link_in_email=False,
                  fail_if_expectations_not_met=True, bigquery_conn_id='bigquery_default', **kwargs):
 
-        super().__init__(expectations_file_name, email_to, send_alert_email, datadocs_link_in_email, datadocs_domain,
-                         fail_if_expectations_not_met, **kwargs)
+        super().__init__(task_id=task_id, expectations_file_name=expectations_file_name, email_to=email_to,
+                         send_alert_email=send_alert_email, datadocs_link_in_email=datadocs_link_in_email,
+                         datadocs_domain=datadocs_domain,
+                         fail_if_expectations_not_met=fail_if_expectations_not_met, **kwargs)
 
         great_expectations_valid_type = set(item.value for item in GreatExpectationsValidations)
 
         self.expectations_file_name = expectations_file_name
-        if validation_type.upper() not in GreatExpectationsValidations:
+        if validation_type.upper() not in GreatExpectationsValidations.__members__:
             raise AirflowException(f"argument 'validation_type' must be one of {great_expectations_valid_type}")
         self.validation_type = validation_type
         self.validation_type_input = validation_type_input
@@ -207,7 +210,6 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
         )
         return data_context_config
 
-
     def get_batch_kwargs(self):
         # Tell GE where to fetch the batch of data to be validated.
         batch_kwargs = {
@@ -239,10 +241,10 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
     def execute(self, context):
 
         # Get the credentials information for the BigQuery data source from the BigQuery Airflow connection
-        data_context = self.create_data_context_config()
+        data_context_config = self.create_data_context_config()
+        data_context = BaseDataContext(project_config=data_context_config)
         self.log.info("Loading expectations...")
         suite = data_context.get_expectation_suite((self.expectations_file_name.rsplit(".", 1)[0]))
-
         batch_kwargs = self.get_batch_kwargs()
 
         self.log.info("Getting the batch of data to be validated...")

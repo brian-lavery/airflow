@@ -284,6 +284,9 @@ google = [
     'grpcio-gcp>=0.2.2',
     'pandas-gbq',
 ]
+great_expectations = [
+    'great_expectations==0.12.1',
+]
 grpc = [
     'google-auth>=1.0.0, <2.0.0dev',
     'google-auth-httplib2>=0.0.1',
@@ -515,6 +518,7 @@ PROVIDERS_REQUIREMENTS: Dict[str, Iterable[str]] = {
     "facebook": facebook,
     "ftp": [],
     "google": google,
+    "great_expectations": great_expectations,
     "grpc": grpc,
     "hashicorp": hashicorp,
     "http": [],

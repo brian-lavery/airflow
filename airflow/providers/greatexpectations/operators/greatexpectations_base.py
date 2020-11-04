@@ -68,9 +68,9 @@ class GreatExpectationsBaseOperator(BaseOperator):
             '''
 
     @apply_defaults
-    def __init__(self, *, expectations_file_name, email_to, send_alert_email=True, datadocs_link_in_email=False,
+    def __init__(self, *, task_id, expectations_file_name, email_to, send_alert_email=True, datadocs_link_in_email=False,
                  datadocs_domain='none', fail_if_expectations_not_met=True, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(task_id=task_id, **kwargs)
 
         self.expectations_file_name = expectations_file_name
         self.email_to = email_to
