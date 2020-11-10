@@ -21,12 +21,14 @@ import datetime
 import logging
 import uuid
 import enum
+from urllib.parse import urlsplit
 
 from airflow.exceptions import AirflowException
 from airflow.hooks.base_hook import BaseHook
 from airflow.utils.decorators import apply_defaults
+from airflow.utils.email import send_email
 
-from airflow.providers.greatexpectations.operators.greatexpectations_base import GreatExpectationsBaseOperator
+from airflow.providers.greatexpectations.operators.great_expectations_base import GreatExpectationsOperator
 from great_expectations.data_context.types.base import DataContextConfig
 from great_expectations.data_context import BaseDataContext
 
@@ -38,7 +40,7 @@ class GreatExpectationsValidations(enum.Enum):
     TABLE = "TABLE"
 
 
-class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
+class GreatExpectationsBigQueryOperator(GreatExpectationsOperator):
     """
          Use Great Expectations to validate data expectations against a BigQuery table or the result of a SQL query.
          The expectations need to be stored in a JSON file sitting in an accessible GCS bucket.  The validation results
@@ -51,8 +53,10 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
             and where the validation files & data docs will be output (e.g. HTML docs showing if the data matches
             expectations).
         :type gcp_project: str
-        :param expectations_file_name: The name of the JSON file containing the expectations for the data.
-        :type expectations_file_name: str
+        :param expectations_suite_name: The name of the expectations suite containing the expectations for the data.
+            The suite should be in a JSON file with the same name as the suite (e.g. if the expectations suite named
+            in the expectations file is 'my_suite' then the expectations file should be called my_suite.json)
+        :type expectations_suite_name: str
         :param gcs_bucket:  Google Cloud Storage bucket where expectation files are stored and where validation outputs
             and data docs will be saved.
             (e.g. gs://<gcs_bucket>/<gcs_expectations_prefix>/<expectations_file_name>
@@ -98,36 +102,60 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
         :type fail_if_expectations_not_met: boolean
     """
 
+    _EMAIL_CONTENT = '''
+            <html>
+              <head>
+                <meta charset="utf-8">
+              </head>
+              <body style="background-color: #fafafa; font-family: Roboto, sans-serif=;">
+                <div style="width: 600px; margin:0 auto;">
+                    <div style="background-color: white; border-top: 4px solid #22a667; border-left: 1px solid #eee; border-right: 1px solid #eee; border-radius: 6px 6px 0 0; height: 24px;"></div>
+                        <div style="background-color: white; border-left: 1px solid #eee; border-right: 1px solid #eee; padding: 0 24px; overflow: hidden;">
+                          <div style="margin-left: 35px;">
+                            Great Expectations Alert<br>
+                            One or more data expectations were not met in the {0} file. {1}
+                       </div>
+              </body>
+            </html>
+            '''
+
     @apply_defaults
-    def __init__(self, *, task_id, gcp_project, expectations_file_name, gcs_bucket, gcs_expectations_prefix,
+    def __init__(self, *, gcp_project, expectation_suite_name, gcs_bucket, gcs_expectations_prefix,
                  gcs_validations_prefix, gcs_datadocs_prefix, validation_type, validation_type_input,
                  bq_dataset_name, email_to, datadocs_domain='none', send_alert_email=True,
                  datadocs_link_in_email=False,
                  fail_if_expectations_not_met=True, bigquery_conn_id='bigquery_default', **kwargs):
 
-        super().__init__(task_id=task_id, expectations_file_name=expectations_file_name, email_to=email_to,
-                         send_alert_email=send_alert_email, datadocs_link_in_email=datadocs_link_in_email,
-                         datadocs_domain=datadocs_domain,
-                         fail_if_expectations_not_met=fail_if_expectations_not_met, **kwargs)
-
         great_expectations_valid_type = set(item.value for item in GreatExpectationsValidations)
 
-        self.expectations_file_name = expectations_file_name
         if validation_type.upper() not in GreatExpectationsValidations.__members__:
             raise AirflowException(f"argument 'validation_type' must be one of {great_expectations_valid_type}")
         self.validation_type = validation_type
         self.validation_type_input = validation_type_input
         self.bigquery_conn_id = bigquery_conn_id
         self.bq_dataset_name = bq_dataset_name
+        self.email_to = email_to
         self.gcp_project = gcp_project
         self.gcs_bucket = gcs_bucket
         self.gcs_expectations_prefix = gcs_expectations_prefix
         self.gcs_validations_prefix = gcs_validations_prefix
         self.gcs_datadocs_prefix = gcs_datadocs_prefix
         self.datadocs_domain = datadocs_domain
+        self.send_alert_email = send_alert_email
+        self.datadocs_link_in_email = datadocs_link_in_email
+        self.fail_if_expectations_not_met = fail_if_expectations_not_met
+
+        # Create a data context and batch_kwargs that will then be handed off to the base operator to do the
+        # data validation against expectations.
+        data_context_config = self.create_data_context_config()
+        data_context = BaseDataContext(project_config=data_context_config)
+        batch_kwargs = self.get_batch_kwargs()
+        super().__init__(data_context=data_context, batch_kwargs=batch_kwargs,
+                         expectation_suite_name=expectation_suite_name, fail_task_on_validation_failure=False,
+                         **kwargs)
 
     def create_data_context_config(self):
-
+        # Get the credentials information for the BigQuery data source from the BigQuery Airflow connection
         conn = BaseHook.get_connection(self.bigquery_conn_id)
         connection_json = conn.extra_dejson
         credentials_path = connection_json['extra__google_cloud_platform__key_path']
@@ -239,33 +267,14 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
         return full_name
 
     def execute(self, context):
-
-        # Get the credentials information for the BigQuery data source from the BigQuery Airflow connection
-        data_context_config = self.create_data_context_config()
-        data_context = BaseDataContext(project_config=data_context_config)
-        self.log.info("Loading expectations...")
-        suite = data_context.get_expectation_suite((self.expectations_file_name.rsplit(".", 1)[0]))
-        batch_kwargs = self.get_batch_kwargs()
-
-        self.log.info("Getting the batch of data to be validated...")
-        batch = data_context.get_batch(batch_kwargs, suite)
-
-        run_id = {
-            "run_name": 'bq',
-            "run_time": datetime.datetime.now(datetime.timezone.utc)
-        }
-
-        self.log.info("Validating batch against expectations...")
-        results = data_context.run_validation_operator(
-            "action_list_operator",
-            assets_to_validate=[batch],
-            run_id=run_id)
-
+        # Execute base operator's validation process
+        results = super().execute()
         validation_result_identifier = list(results['run_results'].keys())[0]
         # For the given validation_result_identifier, get a link to the data docs that were generated by Great
         # Expectations as part of the validation.
         data_docs_url = \
-            data_context.get_docs_sites_urls(resource_identifier=validation_result_identifier, site_name='GCS_site')[0][
+            self.data_context.get_docs_sites_urls(resource_identifier=validation_result_identifier,
+                                                  site_name='GCS_site')[0][
                 'site_url']
         self.log.info("Data docs url is: %s", data_docs_url)
         if results["success"]:
@@ -277,3 +286,34 @@ class GreatExpectationsBigQueryOperator(GreatExpectationsBaseOperator):
                 self.send_alert(data_docs_url)
             if self.fail_if_expectations_not_met:
                 raise AirflowException('One or more expectations were not met')
+
+    def send_alert(self, data_docs_url='none'):
+        results = self._format_email(data_docs_url)
+        email_content = self._EMAIL_CONTENT.format(self.expectation_suite_name, results)
+        send_email(self.email_to, 'expectations in suite ' + self.expectation_suite_name + ' not met', email_content,
+                   files=None, cc=None, bcc=None,
+                   mime_subtype='mixed', mime_charset='us_ascii')
+
+    def _format_email(self, data_docs_url):
+        # If data_docs_url is set to 'none' then only a generic warning will be included in the email.  No clickable
+        # link or path to the data docs will be included.
+        if data_docs_url != 'none':
+            # A data docs url was passed in so a form of it will be added to the email as either a clickable link
+            # or just a non-clickable directory path.
+            if self.datadocs_link_in_email:
+                # Get the domain name of the service serving the data docs.
+                if self.datadocs_domain == 'none':
+                    raise AirflowException(
+                        "datadocs_link_in_email is set to true but datadocs_domain is 'none'.  datadocs_domain should be set to the domain from which datadocs are being served")
+                # Replace the domain returned by ge with the domain set up to serve the data docs
+                parsed = urlsplit(data_docs_url)
+                new_url = parsed._replace(netloc=self.datadocs_domain)
+                results = '  see the results <a href=' + new_url.geturl() + '>here</a>.'
+            else:
+                # From the data docs url, pull out just the directory path to the data docs and send it to the users in the email.
+                parsed = urlsplit(data_docs_url)
+                results = '  See the following location for results:' + parsed.path
+        else:
+            # No link or path to the results will be included in the email
+            results = ''
+        return results

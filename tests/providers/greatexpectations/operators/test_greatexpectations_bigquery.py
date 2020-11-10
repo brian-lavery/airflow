@@ -1,16 +1,19 @@
 import unittest
+import pytest
+from unittest.mock import MagicMock
 
-# import mock
+import mock
 
 from airflow.providers.greatexpectations.operators.greatexpectations_bigquery import GreatExpectationsBigQueryOperator
 
 
 class TestGreatExpectationsBigQueryOperator(unittest.TestCase):
-    # @mock.patch('airflow.providers.greatexpectations.operators.greatexpectations_bigquery')
-    def test_get_temp_table_name(self):
+    @mock.patch('airflow.providers.greatexpectations.operators.greatexpectations_bigquery.BaseHook')
+    def test_get_temp_table_name(self, mock_hook):
         operator = GreatExpectationsBigQueryOperator(
-            task_id='tst',
-            gcp_project='nyt-adtech-dev', expectations_file_name='warning.json',
+            task_id='test_task',
+            gcp_project='nyt-adtech-dev',
+            expectation_suite_name='warning',
             gcs_bucket='great-expectations-nyt-adtech-dev',
             gcs_validations_prefix='validations',
             gcs_datadocs_prefix='data-docs',
@@ -26,3 +29,6 @@ class TestGreatExpectationsBigQueryOperator(unittest.TestCase):
 
         table_name = operator.get_temp_table_name('tmp_', 10)
         assert table_name is not None
+
+
+
